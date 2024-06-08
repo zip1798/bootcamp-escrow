@@ -7,6 +7,11 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  Keypair,
+  NonceAccount,
+  NONCE_ACCOUNT_LENGTH,
+  sendAndConfirmTransaction,
+  sendAndConfirmRawTransaction
 } from "@solana/web3.js";
 import {
   MINT_SIZE,
@@ -44,7 +49,7 @@ describe("escrow", async () => {
     tokenProgram: TOKEN_PROGRAM,
   };
 
-  const [alice, bob, tokenMintA, tokenMintB] = makeKeypairs(4);
+  const [alice, bob, tokenMintA, tokenMintB, nonceKeypair] = makeKeypairs(5);
 
   before(
     "Creates Alice and Bob accounts, 2 token mints, and associated token accounts for both tokens for both users",
@@ -75,6 +80,7 @@ describe("escrow", async () => {
       const sendSolInstructions: Array<TransactionInstruction> = [
         alice,
         bob,
+        
       ].map((account) =>
         SystemProgram.transfer({
           fromPubkey: provider.publicKey,
@@ -239,6 +245,51 @@ describe("escrow", async () => {
     assert(aliceTokenAccountBalanceAfter.eq(tokenBWantedAmount));
   };
 
+  async function checkBalances() {
+    const bobTokenAccountBalanceResponse =
+      await connection.getTokenAccountBalance(accounts.takerTokenAccountA);
+    const bobTokenAccountBalance = new BN(
+      bobTokenAccountBalanceResponse.value.amount
+    );
+
+    const aliceTokenAccountBalanceResponse =
+      await connection.getTokenAccountBalance(accounts.makerTokenAccountB);
+    const aliceTokenAccountBalance = new BN(
+      aliceTokenAccountBalanceResponse.value.amount
+    );
+    // console.log('tokenAOfferedAmount', tokenAOfferedAmount.toNumber());
+    // console.log('tokenBWantedAmount', tokenBWantedAmount.toNumber());
+    // console.log('bobTokenAccountBalance: ', bobTokenAccountBalance.toNumber());
+    // console.log('aliceTokenAccountBalance: ', aliceTokenAccountBalance.toNumber());
+
+    return [bobTokenAccountBalance, aliceTokenAccountBalance];
+  }
+
+  async function createNonceAccount(payer: Keypair, auth: Keypair, nonceAccount: Keypair ) {
+    let tx = new Transaction();
+    tx.add(
+        // create nonce account
+        SystemProgram.createAccount({
+            fromPubkey: payer.publicKey,
+            newAccountPubkey: nonceAccount.publicKey,
+            lamports: await connection.getMinimumBalanceForRentExemption(NONCE_ACCOUNT_LENGTH),
+            space: NONCE_ACCOUNT_LENGTH,
+            programId: SystemProgram.programId,
+        }),
+        // init nonce account
+        SystemProgram.nonceInitialize({
+            noncePubkey: nonceAccount.publicKey, // nonce account pubkey
+            authorizedPubkey: auth.publicKey, // nonce account auth
+        })
+    );
+   
+    await sendAndConfirmTransaction(
+      connection,
+      tx,
+      [payer, nonceAccount]
+    );
+}
+
   it("Puts the tokens Alice offers into the vault when Alice makes an offer", async () => {
     await make();
   });
@@ -246,4 +297,83 @@ describe("escrow", async () => {
   it("Puts the tokens from the vault into Bob's account, and gives Alice Bob's tokens, when Bob takes an offer", async () => {
     await take();
   });
+
+  it("Simple exchange between Alice and Bob, both sign transaction", async () => {
+    const [bobTokenAccountBalanceBefore, aliceTokenAccountBalanceBefore] = await checkBalances();
+
+    const transactionSignature = await program.methods
+      .exchangeTokens(tokenAOfferedAmount, tokenBWantedAmount)
+      .accounts({ ...accounts })
+      .signers([alice, bob])
+      .rpc();
+
+    await confirmTransaction(connection, transactionSignature);
+    const [bobTokenAccountBalanceAfter, aliceTokenAccountBalanceAfter] = await checkBalances();
+    
+    assert(bobTokenAccountBalanceAfter.sub(bobTokenAccountBalanceBefore).eq(tokenAOfferedAmount));
+    assert(aliceTokenAccountBalanceAfter.sub(aliceTokenAccountBalanceBefore).eq(tokenBWantedAmount));
+  });
+
+  it("Exchange between Alice and Bob with using durable nonce", async () => {
+    const [bobTokenAccountBalanceBefore, aliceTokenAccountBalanceBefore] = await checkBalances();
+
+    // Create Nonce Account 
+    await createNonceAccount(alice, alice, nonceKeypair);
+    const nonceAccountInfo = await connection.getAccountInfo(nonceKeypair.publicKey);
+    const nonceAccount = NonceAccount.fromAccountData(nonceAccountInfo.data);
+
+    console.log('Nonce Account: ', nonceKeypair.publicKey.toBase58());
+    console.log('Nonce: ', nonceAccount.nonce);
+    console.log('=====================================================');
+
+    // https://www.soldev.app/course/intro-to-anchor-frontend
+    
+    const transaction = new Transaction({
+      recentBlockhash: nonceAccount.nonce,
+      feePayer: alice.publicKey
+    });
+  
+    transaction.add(
+        SystemProgram.nonceAdvance({
+            noncePubkey: nonceKeypair.publicKey,
+            authorizedPubkey: alice.publicKey,
+        }),
+        await program.methods
+        .exchangeTokens(tokenAOfferedAmount, tokenBWantedAmount)
+        .accounts({ ...accounts })
+        .instruction()
+    );
+  
+    transaction.partialSign(alice);
+
+    // Serialize the transaction and convert to base64 to return it
+    const serializedTransaction = transaction.serialize({
+      // We will need recipient to deserialize and sign the transaction
+      requireAllSignatures: false,
+    });
+    const transactionBase64 = serializedTransaction.toString("base64");
+    console.log(`Partial Sign Transaction: ${transactionBase64}\n`);
+    console.log('=====================================================');
+  
+    
+    await new Promise(r => setTimeout(r, 120000));
+
+    ////////////////////////////////////////////////////////////////////////////////////////////
+    // Recipient part of the transaction
+    
+    // Deserialize the transaction
+    const recoveredTransaction = Transaction.from(
+      Buffer.from(transactionBase64, "base64")
+    );
+  
+    recoveredTransaction.partialSign(bob);
+    await sendAndConfirmRawTransaction(connection, recoveredTransaction.serialize(), {
+      commitment: "confirmed",
+    });
+  
+    const [bobTokenAccountBalanceAfter, aliceTokenAccountBalanceAfter] = await checkBalances();
+    assert(bobTokenAccountBalanceAfter.sub(bobTokenAccountBalanceBefore).eq(tokenAOfferedAmount));
+    assert(aliceTokenAccountBalanceAfter.sub(aliceTokenAccountBalanceBefore).eq(tokenBWantedAmount));
+  });
+
 });

@@ -31,5 +31,9 @@ pub mod escrow {
         instructions::take_offer::withdraw_and_close_vault(context)
     }
 
+    pub fn exchange_tokens(ctx: Context<Exchange>, token_a_amount: u64, token_b_amount: u64) -> Result<()> {
+        instructions::exchange::exchange(ctx, token_a_amount, token_b_amount)
+    }
+
 }
 
